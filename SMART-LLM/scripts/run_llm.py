@@ -8,9 +8,9 @@ from datetime import datetime
 import random
 import subprocess
 
-from openai import OpenAI, APIConnectionError, APITimeoutError
+from openai import OpenAI
 import openai  
-import backoff
+
 from httpx import Timeout                             
 import ai2thor.controller
 
@@ -34,8 +34,7 @@ def build_client(api_key: str, project_id: str | None) -> OpenAI:
     return OpenAI(
         api_key=api_key,
         project=project_id,
-        timeout=Timeout(120.0, connect=30.0),       
-        max_retries=0    
+        timeout=Timeout(45)   
     )
 
 
@@ -49,74 +48,33 @@ def init_client(api_key_file: str, project_id: str | None) -> OpenAI:
         api_key = Path(api_key_file).read_text().strip()
     return build_client(api_key, project_id)
 
-@backoff.on_exception(
-    backoff.expo,
-    (openai.APIConnectionError, openai.APITimeoutError),  
-    max_tries=8,
-    jitter=backoff.full_jitter
-)
-def _chat_retry(client, **kwargs):
-    kwargs.setdefault("stream", True) 
-    return client.chat.completions.create(**kwargs)
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (openai.APIConnectionError, openai.APITimeoutError),  
-    max_tries=8,
-    jitter=backoff.full_jitter
-)
-def _text_retry(client, **kwargs):
-    return client.completions.create(**kwargs)
-
-
-def LM(
-    client,
-    prompt_or_msgs,
-    gpt_version,
-    max_tokens=128,
-    temperature=0,
-    stop=None,
-    logprobs=1,
-    frequency_penalty=0,
-):
-    """
-    Unified wrapper with auto-retry for both text-completion
-    (e.g. text-davinci-003) and chat-completion (gpt-3.5 / gpt-4 / gpt-4o).
-    """
-
-    # ---------- text-completion models ----------
-    if "gpt" not in gpt_version:
-        rsp = _text_retry(
-            client,
-            model=gpt_version,
+def LM(client, prompt_or_msgs, model, max_tokens=128,
+       temperature=0, stop=None, frequency_penalty=0):
+    # ----- text completion -----
+    if "gpt" not in model:
+        rsp = client.completions.create(
+            model=model,
             prompt=prompt_or_msgs,
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
-            logprobs=logprobs,
             frequency_penalty=frequency_penalty,
         )
         return rsp, rsp.choices[0].text.strip()
 
-    # ---------- chat-completion models ----------
-    rsp = _chat_retry(
-        client,
-        model=gpt_version,
+    # ----- chat completion -----
+    rsp = client.chat.completions.create(
+        model=model,
         messages=prompt_or_msgs,
         max_tokens=max_tokens,
         temperature=temperature,
         frequency_penalty=frequency_penalty,
+        stop=stop,
     )
-    if isinstance(rsp, openai.Stream):          # openai>=1.3 Stream 对象
-        content = ""
-        for chunk in rsp:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                content += delta.content
-        return rsp, content.strip()
-
     return rsp, rsp.choices[0].message.content.strip()
+
 
 def set_api_key(api_key_file: str, project_id: str | None = None) -> OpenAI:
     api_key = Path(api_key_file).read_text().strip()
@@ -337,43 +295,41 @@ for i, (plan, solution) in enumerate(zip(decomposed_plan, allocated_plan)):
     code_plan.append(clean)                  ### >>>
 
     
-    # ---------- 保证 code_plan 与 test_tasks 等长 ----------
-    while len(code_plan) < len(test_tasks):
-        code_plan.append("# GENERATION FAILED : EMPTY")
+
 # ------------------------------------------------------
 
 
     # save generated plan
-    exec_folders = []
-    if args.log_results:
-        line = {}
-        now = datetime.now() # current date and time
-        date_time = now.strftime("%m-%d-%Y-%H-%M-%S")
+exec_folders = []
+if args.log_results:
+    line = {}
+    now = datetime.now() # current date and time
+    date_time = now.strftime("%m-%d-%Y-%H-%M-%S")
         
-        for idx, task in enumerate(test_tasks):
-            task_name = "{fxn}".format(fxn = '_'.join(task.split(' ')))
-            task_name = task_name.replace('\n','')
-            folder_name = f"{task_name}_plans_{date_time}"
-            exec_folders.append(folder_name)
+    for idx, task in enumerate(test_tasks):
+        task_name = "{fxn}".format(fxn = '_'.join(task.split(' ')))
+        task_name = task_name.replace('\n','')
+        folder_name = f"{task_name}_plans_{date_time}"
+        exec_folders.append(folder_name)
             
-            os.mkdir("./logs/"+folder_name)
+        os.mkdir("./logs/"+folder_name)
      
-            with open(f"./logs/{folder_name}/log.txt", 'w') as f:
-                f.write(task)
-                f.write(f"\n\nGPT Version: {args.gpt_version}")
-                f.write(f"\n\nFloor Plan: {args.floor_plan}")
-                f.write(f"\n{objects_ai}")
-                f.write(f"\nrobots = {available_robots[idx]}")
-                f.write(f"\nground_truth = {gt_test_tasks[idx]}")
-                f.write(f"\ntrans = {trans_cnt_tasks[idx]}")
-                f.write(f"\nmax_trans = {max_trans_cnt_tasks[idx]}")
+        with open(f"./logs/{folder_name}/log.txt", 'w') as f:
+            f.write(task)
+            f.write(f"\n\nGPT Version: {args.gpt_version}")
+            f.write(f"\n\nFloor Plan: {args.floor_plan}")
+            f.write(f"\n{objects_ai}")
+            f.write(f"\nrobots = {available_robots[idx]}")
+            f.write(f"\nground_truth = {gt_test_tasks[idx]}")
+            f.write(f"\ntrans = {trans_cnt_tasks[idx]}")
+            f.write(f"\nmax_trans = {max_trans_cnt_tasks[idx]}")
 
-            with open(f"./logs/{folder_name}/decomposed_plan.py", 'w') as d:
-                d.write(decomposed_plan[idx])
+        with open(f"./logs/{folder_name}/decomposed_plan.py", 'w') as d:
+            d.write(decomposed_plan[idx])
                 
-            with open(f"./logs/{folder_name}/allocated_plan.py", 'w') as a:
-                a.write(allocated_plan[idx])
+        with open(f"./logs/{folder_name}/allocated_plan.py", 'w') as a:
+            a.write(allocated_plan[idx])
                 
-            with open(f"./logs/{folder_name}/code_plan.py", 'w') as x:
-                x.write(code_plan[idx])
+        with open(f"./logs/{folder_name}/code_plan.py", 'w') as x:
+            x.write(code_plan[idx])
             
